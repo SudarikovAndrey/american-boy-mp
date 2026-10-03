@@ -1,6 +1,7 @@
-// ===== Тестовый стол мультиплеера (?test=1): боты и панель механик =====
+// ===== Боты (любой стол, у хозяина) и панель механик (тестовый стол, ?test=1) =====
 // Решение продюсера 02.10: «чтоб тестировать можно было без противников, осмотреть всё, не привлекая людей других».
-// Подключается только из web/mp.html при ?test=1 (после web/mp.js); у живых столов этого кода нет.
+// Подключается из web/mp.html на любом столе (после web/mp.js): ботов сажает хозяин кнопкой «🤖 + Бот» в пустом месте
+// лобби (backlog 02.10). Панель механик, скорость ×3/мгновенно и «Авто-ход за меня» — только при ?test=1 (H.test).
 //
 // Боты живут внутри страницы хозяина стола как ещё одни клиенты (свой pid, hello/ping/state/end через hub.handle).
 // Ход бота считается в фоне, «в закрытую» (решение продюсера 02.10): без окон и без Джонни хозяина — срез бота
@@ -23,15 +24,104 @@ function hubSend(pid,msg){if(H.hub)H.hub.handle(pid,clone(msg),m=>inbox(pid,m));
 function inbox(pid,m){const b=bots.get(pid);if(!b||!m)return;
   if(m.t==='view'){b.view=m.v;if(acting===pid)H.view=m.v;schedule();}
 }
+// ---- стратегии ботов (продюсер 03.10: «боты должны играть по разным стратегиям и прикидывать, к чему приведёт сделка») ----
+// Все решения о покупке и продаже — по рыночной цене (window.MP_MARKET: доход клетки с цепочкой × круги), а не по вложенному.
+const PROFILES={
+  builder:{name:'строитель',build:.9,cheap:.85,upgrade:.6,offer:.10,buyout:.02,bid:.3,list:.03,hand:.4,swap:.10,sellAt:1.3,buyUpTo:1.0,keep:.15},   // ширится дёшево, копит точки
+  chain:{name:'цепочки',build:.8,cheap:.6,upgrade:.4,offer:.35,buyout:.08,bid:.5,list:.02,hand:.4,swap:.45,sellAt:1.8,buyUpTo:1.5,keep:.10},      // собирает соседей, за них платит дороже
+  trader:{name:'делец',build:.8,cheap:.6,upgrade:.6,offer:.25,buyout:.04,bid:.7,list:.12,hand:.3,swap:.20,sellAt:1.1,buyUpTo:1.1,keep:.15},        // держит кассу, продаёт выгодно, ставит на торгах
+  saboteur:{name:'пакостник',build:.75,cheap:.7,upgrade:.4,offer:.15,buyout:.10,bid:.4,list:.03,hand:.9,swap:.10,sellAt:1.5,buyUpTo:1.2,keep:.15}, // бьёт лидера картами и выкупом
+};
+const PROFILE_ORDER=['chain','trader','saboteur','builder'];
+const profOf=pid=>{const b=bots.get(pid);return PROFILES[(b&&b.profile)||'builder'];};
+const MV=(i,buyer)=>window.MP_MARKET?MP_MARKET(i,buyer):0;
+const adjOwn=i=>[S.tiles[(i+39)%40],S.tiles[(i+1)%40]].some(x=>x&&x.owner&&(x.type==='kiosk'||x.type==='biz'));   // клетка рядом со своей — достроит цепочку
+// ===== Одна оценка всех сделок (Андрей 03.10: «бот предлагает невыгодный для него обмен, разбивает свою группу;
+// обмен, продажа, покупка выглядят хаотично — бот должен следовать одной из стратегий») =====
+// Ценность владений бота = Σ база клетки × (1 + вес группы профиля × число своих соседей). База — рыночная цена
+// клетки без группы (MP_MARKET ÷ групповой множитель хозяина, не ниже вложенного). Любая сделка — обмен, ответ на
+// предложение, покупка, своё предложение, выкуп, ставка, лот, продажа за долги — проходит, только если ценность
+// растёт с запасом профиля. Поэтому бот не рвёт свою группу без компенсации и не платит больше, чем клетка ему стоит.
+const VALUE={
+  chain:{groupW:.6,margin:.05,swaps:true,swapPause:4,offerPause:2},      // соседство ценит вдвое выше реального бонуса — тянется к улицам
+  trader:{groupW:.25,margin:.2,swaps:true,swapPause:6,offerPause:3},     // по реальной ренте, только с наценкой
+  saboteur:{groupW:.25,margin:.15,swaps:false,spite:.5,offerPause:3},   // доплачивает за то, что ослабит лидера
+  builder:{groupW:.35,margin:.35,swaps:false,offerPause:4},  // держится за своё
+};
+const ME='\u0001me',GROUP=.25;
+const tradeOk=t=>!!t&&(t.type==='kiosk'||t.type==='biz')&&!(typeof sfIsLot==='function'&&sfIsLot(t));
+const profKey=pid=>{const b=bots.get(pid);return (b&&b.profile)||'builder';};
+const valOf=pid=>VALUE[profKey(pid)]||VALUE.builder;
+// Снимок поля на одно решение: хозяева и базы клеток считаются один раз (MP_MARKET не дёшев, а обменов перебираются сотни).
+let snap=null;
+const snapKey=()=>S.tiles.map(t=>(t.owner?1:0)+(t.rival||'')+(t.salesLvl||0)+(t.level||0)+'|'+(t.price||0)+(t.base||'')).join();
+function freshSnap(){const o=S.tiles.map(t=>tradeOk(t)?(t.owner?ME:(t.rival||null)):null);
+  const base=S.tiles.map((t,i)=>{if(!tradeOk(t))return 0;const inv=H.invested(t),own=o[i];if(!own)return inv;
+    const nb=(o[(i+39)%40]===own)+(o[(i+1)%40]===own);return Math.max(inv,MV(i)/(1+GROUP*nb));});
+  const cat=S.tiles.map(t=>tradeOk(t)&&t.type==='kiosk'&&t.base&&!t.lot?t.base:null);
+  return snap={o,base,cat,key:snapKey()};}
+const snapNow=()=>snap&&snap.key===snapKey()?snap:freshSnap();
+const baseAt=i=>snapNow().base[i];
+const ownersNow=()=>snapNow().o;
+// Вклад клетки i в ценность владельца who при хозяевах f(j).
+const cellWorth=(i,f,base,w,who)=>f(i)!==who?0:base[i]*(1+w*((f((i+39)%40)===who)+(f((i+1)%40)===who)));
+// Сколько бот выигрывает (минус — теряет) от смены хозяев: change = {клетка: ME | pid | null}. Считаются только
+// изменённые клетки и их соседи. У пакостника к выгоде прибавляется доля того, что от сделки теряет лидер.
+function gainOf(change,V,leader){const sn=snapNow(),o=sn.o,base=sn.base,a=j=>o[(j+40)%40],b=j=>{j=(j+40)%40;return j in change?change[j]:o[j];};
+  const touched=new Set();for(const k in change){const i=+k;touched.add((i+39)%40);touched.add(i);touched.add((i+1)%40);}
+  let d=0,hurt=0;for(const i of touched){d+=cellWorth(i,b,base,V.groupW,ME)-cellWorth(i,a,base,V.groupW,ME);
+    if(V.spite&&leader)hurt+=cellWorth(i,a,base,GROUP,leader)-cellWorth(i,b,base,GROUP,leader);}
+  // Благосостояние города: каждая своя категория — +prosp ко всем ценам продажи своих точек (SF: +6%).
+  // Без этого бот не видел смысла в напитках или одежде при своих сладостях — и звал только на «Лоток сладостей».
+  if(Object.keys(change).some(k=>sn.cat[+k]))d+=cityWorth(b,sn)-cityWorth(a,sn);
+  return d+(V.spite?V.spite*Math.max(0,hurt):0);}
+const PROSP=()=>(window.SFBuilder&&+SFBuilder.prosp)||.06;
+function cityWorth(f,sn,who=ME){const cats=new Set();let sum=0;for(let i=0;i<40;i++){if(f(i)!==who||!sn.cat[i])continue;cats.add(sn.cat[i]);sum+=sn.base[i];}
+  return PROSP()*cats.size*sum;}
+const leaderOf=v=>{const ps=v.players.filter(p=>p.pid!==H.PID).sort((a,b)=>(b.cap?b.cap.total:b.cash)-(a.cap?a.cap.total:a.cash));return ps[0]&&ps[0].pid;};
+const brainLog=(bot,msg)=>trace.push(`${bot?bot.name:'бот'} (${(PROFILES[profKey(H.PID)]||{}).name||''}): ${msg}`);
+// Лучший обмен: до 2 клеток с каждой стороны; соперник по базе клеток не теряет (доплату ставим так, чтобы ему было
+// не обидно), бот выигрывает не меньше запаса профиля. Одинаковое предложение не повторяет 12 кругов стола.
+// Выгода соперника who от смены хозяев — глазами среднего игрока: реальный бонус соседства и категории города.
+// Раньше бот смотрел только, чтобы база соперника не падала, — и звал рвать его улицу: 111 отказов на 117 обменов
+// (прогон «Дебага» 03.10). Теперь зовёт на обмен, выгодный обоим, а соперника в минусе догоняет доплатой.
+const THEIR_MARGIN=.1;
+function theirGain(change,who){const sn=snapNow(),o=sn.o,base=sn.base,a=j=>o[(j+40)%40],b=j=>{j=(j+40)%40;return j in change?change[j]:o[j];};
+  const touched=new Set();for(const k in change){const i=+k;touched.add((i+39)%40);touched.add(i);touched.add((i+1)%40);}
+  let d=0;for(const i of touched)d+=cellWorth(i,b,base,GROUP,who)-cellWorth(i,a,base,GROUP,who);
+  if(Object.keys(change).some(k=>sn.cat[+k]))d+=cityWorth(b,sn,who)-cityWorth(a,sn,who);
+  return d;}
+function bestSwap(V,v,keep){
+  const combos=arr=>{const out=[];for(let a=0;a<arr.length;a++){out.push([arr[a]]);for(let c=a+1;c<arr.length;c++)out.push([arr[a],arr[c]]);}return out;};
+  const free=i=>MPSwap.free(i);
+  // Отдаёт только то, что было его на начало хода по столу: точка, построенная в этот ход, у хозяина стола ещё
+  // пустырь — обмен на неё выглядел бы как «пустырь в обмен» (нашёл «Интерфейс» 03.10). Со следующего хода — можно.
+  const synced=i=>!v.tiles||(v.tiles[i]&&v.tiles[i].owner===H.PID&&v.tiles[i].base===S.tiles[i].base);
+  const mine=S.tiles.filter(t=>t.owner&&tradeOk(t)&&free(t.i)&&synced(t.i)).map(t=>({i:t.i,k:-gainOf({[t.i]:null},V)})).sort((a,c)=>a.k-c.k).slice(0,8).map(e=>e.i);if(!mine.length)return null;
+  const asked=S.botAsked||{},round=Math.floor(v.turn.n/v.players.length),lastTo=S.botSwapTo||{};let best=null;
+  for(const p of v.players){if(p.pid===H.PID)continue;
+    if(lastTo[p.pid]!=null&&round-lastTo[p.pid]<(V.swapPause||6))continue;   // этому игроку недавно предлагал — не засыпает обменами
+    const theirs=S.tiles.filter(t=>t.rival===p.pid&&tradeOk(t)&&free(t.i)).map(t=>({i:t.i,k:gainOf({[t.i]:ME},V)})).sort((a,c)=>c.k-a.k).slice(0,8).map(e=>e.i);if(!theirs.length)continue;
+    for(const give of combos(mine))for(const get of combos(theirs)){
+      const ch={};for(const i of give)ch[i]=p.pid;for(const i of get)ch[i]=ME;
+      const g=gainOf(ch,V),bGive=give.reduce((x,i)=>x+baseAt(i),0),bGet=get.reduce((x,i)=>x+baseAt(i),0);
+      const tg=theirGain(ch,p.pid),need=THEIR_MARGIN*Math.max(50,bGet);   // соперник отдаёт get, получает give и доплату
+      const pays=MPSwap.pays.filter(x=>tg+x>=need&&(x<=0||S.cash-x>=keep));if(!pays.length)continue;   // pay>0 — доплачивает бот
+      const pay=Math.min(...pays),net=g-pay;if(net<V.margin*Math.max(50,bGive))continue;
+      const key=give.join('.')+'>'+get.join('.')+'@'+p.pid;if(asked[key]!=null&&v.turn.n-asked[key]<12*v.players.length)continue;
+      if(!best||net>best.net)best={to:p.pid,give,get,pay,net,key};}}
+  if(!best)return null;
+  const pv=MPSwap.preview({to:best.to,give:best.give,get:best.get,pay:best.pay});if(!pv.ok&&!/одно предложение/.test(pv.reason||''))return null;
+  return best;}
 function addBot(){
   if(!H.hub){toast('Боты — только у хозяина стола');return false;}
   const v=H.view;if(!v||v.phase!=='lobby'){toast('Ботов сажают в лобби');return false;}
   if(bots.size>=3||v.players.length>=C.MAX_PLAYERS){toast('Мест нет');return false;}
   const i=bots.size+1,pid='bot'+i+Math.random().toString(36).slice(2,6),name=NAMES[i-1]||('Бот '+i);
-  const b={pid,name,view:null};bots.set(pid,b);
+  const b={pid,name,view:null,profile:PROFILE_ORDER[(i-1)%PROFILE_ORDER.length]};bots.set(pid,b);
   hubSend(pid,{t:'hello',pid,name});
   b.ping=setInterval(()=>hubSend(pid,{t:'ping'}),2500);
-  toast(`🤖 ${name} сел за стол`,1800);return true;
+  toast(`🤖 ${name} сел за стол — стратегия «${PROFILES[b.profile].name}»`,2200);return true;
 }
 function removeBots(){for(const b of bots.values()){clearInterval(b.ping);hubSend(b.pid,{t:'bye'});}bots.clear();}
 function schedule(){
@@ -42,6 +132,20 @@ function schedule(){
   const hv=H.view;if(autoMe&&hv&&hv.phase==='play'&&hv.turn&&hv.turn.pid===H.PID&&!hv.paused&&!$('onboard')){pendingT=setTimeout(()=>{pendingT=0;playTurn(H.PID);},dly(1200));}
 }
 setInterval(schedule,700);
+// После перезагрузки страницы хозяина стол поднимается из localStorage (mp.js, hostTable), а боты жили только
+// в памяти этой страницы — их ходы больше никто не делал, стол вставал. На первом же хабе (это и есть
+// восстановленный стол) возвращаем ботов по pid из T.players: ping снова делает их online и подключает ответы
+// (hub.handle, case 'ping'), дальше view и ходы — как обычно. Один раз на хаб: убранные вручную не воскресают.
+const seenHubs=new WeakSet();
+function adoptRestored(){
+  const hub=H.hub,T=hub&&hub.T;if(!T||!Array.isArray(T.players)||seenHubs.has(hub))return;
+  seenHubs.add(hub);
+  for(const p of T.players){if(!/^bot\d/.test(p.pid)||bots.has(p.pid))continue;
+    const k=+((p.pid.match(/^bot(\d)/)||[])[1]||1),b={pid:p.pid,name:p.name,view:null,profile:PROFILE_ORDER[(k-1)%PROFILE_ORDER.length]};bots.set(p.pid,b);   // стратегия — по номеру места бота в pid, как в addBot
+    hubSend(p.pid,{t:'ping'});b.ping=setInterval(()=>hubSend(p.pid,{t:'ping'}),2500);
+    trace.push(p.name+': вернулся за стол после перезагрузки');}
+}
+setInterval(adoptRestored,500);
 // Сторож: сцена не ответила (вкладка в фоне) — снимаем флаг движения и закрываем окна, иначе стол встанет.
 function unstick(){try{if(typeof moving!=='undefined')moving=false;}catch(e){}H.closeAll();const l=document.querySelector('.minigame-layer');if(l){try{l.remove();}catch(e){}}console.warn('bot: ход застрял, сторож снял движение');trace.push('сторож');}
 async function settle(max=250){
@@ -143,17 +247,26 @@ async function botTurnHidden(pid){
   try{
     const s=clone(v.mine);s.tiles=botLocal(v,pid);S=s;H.view=v;H.PID=pid;    // тихая подмена, синхронно, без render
     // 1. Ответы на предложения о покупке своих клеток
-    for(const t of S.tiles.filter(x=>x.owner&&x.mpOffer)){const o=t.mpOffer,inv=H.invested(t);
-      if(o.amount>=inv*2||rnd(.35)){S.cash+=o.amount;credit(o.from,0,{escrow:-o.amount});t.mpPrem=o.amount-(inv-(t.mpPrem||0));t.owner=null;t.rival=o.from;delete t.mpOffer;
+    const P=profOf(pid);
+    const V=valOf(pid);freshSnap();
+    // Продаёт, если цена покрывает потерю ценности (с ослабленной группой) с наценкой профиля.
+    for(const t of S.tiles.filter(x=>x.owner&&x.mpOffer)){const o=t.mpOffer,inv=H.invested(t),need=Math.max(inv,-gainOf({[t.i]:o.from},V))*P.sellAt;
+      if(o.amount>=need){brainLog(b,`продаёт «${titleOf(t)}» за $${o.amount} (порог $${Math.round(need)})`);S.cash+=o.amount;credit(o.from,0,{escrow:-o.amount});t.mpPrem=o.amount-(inv-(t.mpPrem||0));t.owner=null;t.rival=o.from;delete t.mpOffer;
         emit({kind:'sale',text:`продал «${titleOf(t)}»`,amount:o.amount,tile:t.i,to:o.from});trace.push(b.name+': продал по предложению');}
       else{delete t.mpOffer;credit(o.from,o.amount,{escrow:-o.amount});emit({kind:'decline',text:`отказал в продаже «${titleOf(t)}»`,amount:null,tile:t.i,to:o.from});}}
-    // 1б. Ответы на предложения обмена: согласен, если получает не дешевле (с доплатой), иначе изредка
-    for(const t of S.tiles.filter(x=>x.owner&&x.mpSwap)){const o=t.mpSwap,g=S.tiles[o.give];
-      const ok=g&&g.rival===o.from&&(o.pay>=0||S.cash>=-o.pay)&&(H.invested(g)+o.pay>=H.invested(t)*0.9||rnd(.25));
-      if(ok){const key=H.pairKey(pid,o.from);if(o.pay>0){S.cash+=o.pay;credit(o.from,0,{escrow:-o.pay});}else if(o.pay<0){S.cash+=o.pay;credit(o.from,-o.pay);}
-        delete t.mpSwap;t.owner=null;t.rival=o.from;g.owner='you';delete g.rival;t.mpSwapPair=key;g.mpSwapPair=key;
-        emit({kind:'swapped',text:`обменял «${titleOf(t)}» на «${titleOf(g)}»`,amount:null,tile:g.i,to:o.from});trace.push(b.name+': принял обмен');}
-      else{delete t.mpSwap;if(o.pay>0)credit(o.from,o.pay,{escrow:-o.pay});emit({kind:'decline',text:`отказал в обмене на «${titleOf(t)}»`,amount:null,tile:t.i,to:o.from});}}
+    // 1б. Обмены: принимает, если его ценность (с группами) растёт с запасом профиля с учётом доплаты; встречных не шлёт.
+    if(window.MPSwap){const L=MPSwap._local,bc=(to,cash,x)=>credit(to,cash,{escrow:x&&x.escrow||undefined});
+      for(const inc of MPSwap.incoming()){const o=L.byId(inc.id);if(!o)continue;const pv=MPSwap.preview({to:inc.from,give:inc.give,get:inc.get,pay:inc.pay});
+        const ch={};for(const i of inc.give)ch[i]=inc.from;for(const i of inc.get)ch[i]=ME;
+        const bGive=inc.give.reduce((x,i)=>x+baseAt(i),0),net=gainOf(ch,V)-inc.pay;
+        const ok=net>=V.margin*Math.max(50,bGive)&&!(inc.pay>0&&S.cash-inc.pay<S.cash*P.keep);
+        brainLog(b,`обмен ${ok?'принят':'отклонён'}: ${net>=0?'+':''}${Math.round(net)}`);
+        if(ok&&L.accept(o,bc,emit))trace.push(b.name+': принял обмен');else{if(MPSwap._local.byId(inc.id))L.decline(o,bc,emit,false);trace.push(b.name+': отказал в обмене');}}}
+    // 1в. Предложения продажи боту: берёт, если клетка стоит для него дороже цены с запасом профиля и касса остаётся.
+    for(const t of S.tiles.filter(x=>x.rival&&x.mpSale&&x.mpSale.to===pid)){const o=t.mpSale,g=gainOf({[t.i]:ME},V,leaderOf(v));
+      if(o.amount*(1+V.margin)<=g&&S.cash-o.amount>=S.cash*P.keep){brainLog(b,`покупает «${titleOf(t)}» за $${o.amount} (ценность $${Math.round(g)})`);S.cash-=o.amount;credit(o.from,o.amount,{sale:true,tile:t.i});t.mpPrem=o.amount-(H.invested(t)-(t.mpPrem||0));t.owner='you';delete t.rival;delete t.mpSale;
+        emit({kind:'salebought',text:`купил «${titleOf(t)}» за $${o.amount}`,amount:null,tile:t.i,to:o.from});trace.push(b.name+': купил по предложению продажи');}
+      else{delete t.mpSale;emit({kind:'decline',text:`отказался купить «${titleOf(t)}»`,amount:null,tile:t.i,to:o.from});}}
     // 2. Бросок и движение
     const a=1+Math.floor(Math.random()*6),bb=1+Math.floor(Math.random()*6),sum=a+bb,dbl=a===bb;dice={a,b:bb};
     if(S.jail>0){if(dbl){S.jail=0;trace.push(b.name+': дубль — вышел из участка');}else{S.jail--;trace.push(b.name+': в участке, попыток '+S.jail);}}
@@ -171,7 +284,7 @@ async function botTurnHidden(pid){
   }catch(e){console.error('bot hidden',e);}
   finally{
     const slice=sliceOfBot(S),shared=botShared(S.tiles,pid);
-    S=S0;H.view=view0;H.PID=pid0;
+    S=S0;H.view=view0;H.PID=pid0;try{render();}catch(e){}   // карта из руки бота могла перерисовать экран его срезом
     for(const e of evts)hubSend(pid,{t:'evt',e});
     const pack={n,s:slice,tiles:shared,credits,rolled:true,landed:true,dice};
     hubSend(pid,{t:'state',pack});
@@ -185,6 +298,10 @@ async function botTurnHidden(pid){
 function lapHidden({credit,emit}){
   S.laps=(S.laps||0)+1;let income=0,units=0;const mult=SFB()&&SFB().priceMult?SFB().priceMult():1;
   for(const t of myKiosks()){const k=Math.min(sales(t),t.goods||0);if(k<=0)continue;t.goods-=k;units+=k;income+=Math.round(k*H.sellOf(t.good)*mult);}
+  if(S.mpLapCut!=null){income=Math.round(income*S.mpLapCut);delete S.mpLapCut;}   // карта соперника: демпинг или забастовка
+  if(S.mpLapBoost){income=Math.round(income*S.mpLapBoost);delete S.mpLapBoost;}   // своя «Акция»
+  income+=window.MP_START_BONUS_NOW?MP_START_BONUS_NOW():100;   // проход старта: $100 по кругам, $50 по времени
+  if(window.MP_IS_UNDERDOG&&MP_IS_UNDERDOG()){const ex=window.MP_UNDERDOG_BONUS?MP_UNDERDOG_BONUS():50;income+=ex;emit({kind:'underdog',text:`пособие отстающему $${ex}`,amount:ex,tile:0});}
   if(income>0){S.cash+=income;S.stat.earned=(S.stat.earned||0)+income;emit({kind:'pass',text:'прошёл старт — продажи',amount:income,tile:0});}
   credit(null,0,{slot:10});
   for(const l of (S.loans||[]))if(l.micro){const i=Math.round(l.principal*l.rate);S.cash-=i;}
@@ -197,7 +314,7 @@ function collectHidden(t,{credit,emit}){
   t.drop=null;
 }
 function landHidden(t,ctx){
-  const {credit,emit,v,after,bot}=ctx;if(!t)return;const n=v.turn.n;
+  const {credit,emit,v,after,bot}=ctx;if(!t)return;const n=v.turn.n,P=profOf(H.PID);
   collectHidden(t,ctx);
   // Инспектор (продюсер 02.10: «бот реагирует так же, как игрок»): клетка инспектора рассылает проверки по его точкам,
   // своя точка под проверкой — бот платит штраф, если есть деньги, и снимает проверку.
@@ -208,29 +325,45 @@ function landHidden(t,ctx){
       if(t.rival){rentHidden(t,ctx);break;}
       if(!t.owner){   // пустырь: строим, чаще дешёвое, иногда лицензию
         const cats=Object.keys(SFB().build||{}),open=cats.filter(c=>catOpen(c)&&S.cash>=SFB().price(c)).sort((x,y)=>SFB().price(x)-SFB().price(y));
-        if(!open.length||!rnd(.85))break;
+        if(!open.length||!rnd(adjOwn(t.i)?Math.max(P.build,.95):P.build))break;   // рядом со своей — строит почти всегда
         if(rnd(.12)){const lic=(SFB().licenses||[]).find(l=>!SFB().hasLic(l.id)&&S.cash>=l.price*1.3);if(lic){S.sf=S.sf||{};S.sf.lic=S.sf.lic||{};S.sf.lic[lic.id]=true;S.cash-=lic.price;emit({kind:'license',text:`купил лицензию «${lic.name}»`,amount:-lic.price,tile:t.i});}}
-        const cat=rnd(.7)?open[0]:pick(open),p=SFB().price(cat);if(S.cash<p)break;
+        const cat=rnd(P.cheap)?open[0]:pick(open),p=SFB().price(cat);if(S.cash<p)break;
         S.cash-=p;Object.assign(t,{owner:'you',good:cat,base:cat,lot:false,price:p,price0:p,capLvl:1,salesLvl:1,goods:0,tier:1,insp:false});delete t.mpPrem;
         S.stat.bought=(S.stat.bought||0)+1;
         emit({kind:'build',text:`построил «${titleOf(t)}»`,amount:-p,tile:t.i});trace.push(bot.name+': построил '+titleOf(t)+' за $'+p);
         fillGoods(t,.5);break;}
       // своя точка: прокачка (50%) и дозакупка
-      if(rnd(.5)&&canUp(t)){const cost=upCost(t);if(S.cash>=cost){S.cash-=cost;if(t.capLvl<capTab(t).length)t.capLvl++;if(t.salesLvl<salTab(t).length)t.salesLvl++;emit({kind:'upgrade',text:`прокачал «${titleOf(t)}»`,amount:-cost,tile:t.i});}}
+      if(rnd(P.upgrade)&&canUp(t)){const cost=upCost(t);if(S.cash>=cost){S.cash-=cost;if(t.capLvl<capTab(t).length)t.capLvl++;if(t.salesLvl<salTab(t).length)t.salesLvl++;emit({kind:'upgrade',text:`прокачал «${titleOf(t)}»`,amount:-cost,tile:t.i});}}
       fillGoods(t,.4);break;}
-    case 'biz':{
+    case 'biz':{   // бизнесы бустят друг друга — «цепочки» и «делец» берут охотнее
       if(t.rival){rentHidden(t,ctx);break;}
-      if(!t.owner&&rnd(.3)&&S.cash>=t.price*1.5){S.cash-=t.price;t.owner='you';t.level=t.level||1;emit({kind:'build',text:`купил бизнес «${titleOf(t)}»`,amount:-t.price,tile:t.i});trace.push(bot.name+': купил бизнес');}
+      if(!t.owner&&rnd(P===PROFILES.chain||P===PROFILES.trader?.6:.3)&&S.cash>=t.price*1.5){S.cash-=t.price;t.owner='you';t.level=t.level||1;emit({kind:'build',text:`купил бизнес «${titleOf(t)}»`,amount:-t.price,tile:t.i});trace.push(bot.name+': купил бизнес');}
       break;}
-    case 'wh':for(const k of myKiosks())fillGoods(k,.35);break;
+    case 'wh':if(!myKiosks().length){S.cash+=20;emit({kind:'bonus',text:'утешительный приз на складе',amount:20,tile:t.i});}for(const k of myKiosks())fillGoods(k,.35);break;
     case 'chance':chanceHidden(ctx);break;
     case 'police':{const fine=policeFine();
       if(S.cash>=fine&&rnd(.7)){S.cash-=fine;credit(null,0,{pot:fine});emit({kind:'fine',text:'заплатил полиции',amount:-fine,tile:t.i});}
       else{S.jail=CFG.POLICE.attempts;S.jailFine=0;emit({kind:'jail',text:'сел в участок',amount:null,tile:t.i});}break;}
     case 'slot':slotHidden(t,ctx);break;
     case 'pot':{const m=Math.round(v.pot||0);if(m>0){S.cash+=m;credit(null,0,{potTake:true});emit({kind:'minigame',text:'сорвал копилку',amount:m,tile:t.i});}break;}
-    default:break;   // старт, банк, инкассатор, инспектор — бот не трогает
+    case 'scatter':scatterHidden(t,ctx);break;
+    default:break;   // старт, банк, инспектор — бот не трогает
   }
+}
+// Инкассатор у бота: мешок лопается так же, как у игрока (scatter() в web/index.html — «мешок лопается всегда»):
+// сначала закрытые клетки, мало — любые точки и бизнесы. Находки ложатся на клетки среза и уходят столу вместе
+// с полем; событие 'scatter' отыгрывает разлёт на поле хозяина, как у живого соперника (mp.js, flyDrops/onEvt).
+function scatterHidden(t,{emit}){
+  const c=CFG.SCATTER,sc=S.day||1,ok=x=>x.i!==S.pos&&x.i!==0&&!x.drop;
+  let spots=S.tiles.filter(x=>!unlocked(x)&&ok(x));
+  if(spots.length<c.drops){const more=S.tiles.filter(x=>unlocked(x)&&ok(x)&&(x.type==='kiosk'||x.type==='biz')).sort(()=>Math.random()-0.5);spots=spots.concat(more.slice(0,c.drops-spots.length));}
+  spots.sort(()=>Math.random()-0.5);
+  const drops=[];let cash=0;
+  for(const x of spots.slice(0,c.drops)){const r=Math.random();let d;
+    if(r<c.hardChance)d={hard:1};else if(r<c.hardChance+c.rollsChance)d={rolls:2};
+    else{const m=(c.min+Math.floor(Math.random()*(c.max-c.min)))*sc;d={cash:m};cash+=m;}
+    x.drop=typeof mergeDrop==='function'?mergeDrop(x.drop,d):d;drops.push({to:x.i,drop:d});}
+  if(drops.length)emit({kind:'scatter',text:'растерял мешок инкассатора',amount:null,tile:t.i,cash,drops});
 }
 function rentHidden(t,{credit,emit,v}){
   const n=v.turn.n;if(t.insp||(t.frozen&&t.frozen>n)||(S.mpShieldN&&n<=S.mpShieldN))return;
@@ -239,15 +372,18 @@ function rentHidden(t,{credit,emit,v}){
 }
 // «Шанс» бота: денежные карты той же колоды плюс изредка пакость (сдвиг, пропуск хода) через удар стола.
 function chanceHidden({credit,emit,v,after}){
-  const rivals=v.players.filter(p=>p.pid!==H.PID),r=rnd;let text,amount=null;
+  // Пакость — в руку (до 2 карт), как у игрока; сыграет бот позже в strategyHidden.
+  if(window.MPHand&&(S.mpHand||[]).length<MPHand.max&&rnd(.5)){const ids=Object.keys(MPHand.cards);S.mpHand=(S.mpHand||[]).concat(pick(ids));emit({kind:'hand',text:'взял карту в руку',amount:null,tile:S.pos});trace.push('бот: карта в руку');return;}
+  // Денежные карты бота — те же, что у игрока, и тоже от среднего дохода стола за круг.
+  const rivals=v.players.filter(p=>p.pid!==H.PID);let text,amount=null;
+  const U=Math.max(50,Math.round((window.MP_LAP_P?window.MP_LAP_P():100)/5)*5),k=x=>Math.max(10,Math.round(U*x/5)*5);
   const roll=Math.random();
-  if(roll<.2){amount=60;S.cash+=60;text='👟 Нашёл в старых кроссовках $60. Америка!';}
-  else if(roll<.4){amount=-40;S.cash-=40;credit(null,0,{pot:40});text='🚗 Штраф за парковку $40 — в общую копилку.';}
-  else if(roll<.55&&rivals.length){amount=30*rivals.length;S.cash+=amount;for(const p of rivals)credit(p.pid,-30);text='🎂 День рождения! Каждый соперник скидывается по $30.';}
-  else if(roll<.7&&rivals.length){amount=-20*rivals.length;S.cash+=amount;for(const p of rivals)credit(p.pid,20);text='🍻 Проставился пацанам: по $20 каждому.';}
-  else if(roll<.85&&rivals.length){const p=pick(rivals);after.push({t:'hit',h:{k:'move',to:p.pid,d:-3}});text=`🚧 Ремонт дороги: ${p.name} откатывается на 3 клетки назад.`;}
+  if(roll<.25){const a=k(.4);amount=-a;S.cash-=a;credit(null,0,{pot:a});text=`🚗 Штраф за парковку $${a} — в общую копилку.`;}
+  else if(roll<.45&&myKiosks().length){S.mpLapBoost=1.5;text='🏷 Акция «Два по цене одного»: на следующем проходе старта продажи ×1,5.';}
+  else if(roll<.65&&myKiosks().some(t=>t.goods<cap(t))){let n=0;for(const t of myKiosks()){const add=Math.ceil((cap(t)-t.goods)/2);if(add>0){t.goods+=add;n+=add;}}text=`🚚 Оптовый завоз: точки заполнились наполовину бесплатно (+${n} шт).`;}
+  else if(roll<.8&&rivals.length){const a=k(.25);amount=-a;S.cash-=a;for(const p of rivals)credit(p.pid,-a);credit(null,0,{pot:a*(rivals.length+1)});text=`🚔 Облава на районе: все платят в копилку по $${a}.`;}
   else if(rivals.length){const p=pick(rivals);after.push({t:'hit',h:{k:'skip',to:p.pid}});text=`⏳ Очередь в ЖЭК: ${p.name} пропускает следующий ход.`;}
-  else{amount=60;S.cash+=60;text='👟 Нашёл в старых кроссовках $60.';}
+  else{const a=k(.4);amount=a;S.cash+=a;text=`📺 Сюжет на MTV: $${a} за интервью.`;}
   emit({kind:'chance',text,amount,tile:S.pos});
 }
 function inspHidden(t,{emit}){
@@ -264,7 +400,7 @@ function inspHidden(t,{emit}){
 // Автомат в фоне: бесплатные спины тем же движком и таблицей выплат; на поле — только результат.
 function slotHidden(t,{credit,emit,v}){
   const E=window.SlotEngine;if(!E)return;
-  const st={P:Math.max(0,Math.round(typeof window.MP_LAP_P==='function'?window.MP_LAP_P():lapNet())),day:S.day||1,pot:Math.round(v.slotPot||0),rollCash:H.rollCash(),visits:1};
+  const st={P:Math.max(0,Math.round(typeof window.MP_SLOT_BASE==='function'?window.MP_SLOT_BASE():lapNet())),day:S.day||1,pot:Math.round(v.slotPot||0),rollCash:window.MP_ROLL_CASH?window.MP_ROLL_CASH():H.rollCash(),mp:true,visits:1};
   let cash=0,potD=10,gem=0;
   for(let i=0;i<3;i++){const o=E.choose(Math.random),p=E.award(st,o,[]);
     if(o.id==='jackpot'){cash+=p.cash;gem+=p.gem;potD-=st.pot;st.pot=0;}
@@ -274,31 +410,69 @@ function slotHidden(t,{credit,emit,v}){
   emit({kind:'minigame',text:cash?'выиграл в автомате':'крутил автомат впустую',amount:cash||null,tile:t.i});
 }
 function strategyHidden({credit,emit,v,after,bot}){
-  const t=S.tiles[S.pos],n=v.turn.n,f=force;force=null;
+  const t=S.tiles[S.pos],n=v.turn.n,f=force,P=profOf(H.PID);force=null;
   const mine=S.tiles.filter(x=>x.owner&&(x.type==='kiosk'||x.type==='biz')&&!(typeof sfIsLot==='function'?sfIsLot(x):(!x.owner&&(x.lot||x.good==='lot')))&&!H.lotOn(x.i)).sort((a,b)=>H.invested(a)-H.invested(b));
   const rivalHere=H.isRival(t)&&!H.lotOn(t.i)&&!t.mpOffer;
-  const offer=(tt,m)=>{const amount=Math.round(H.invested(tt)*m);if(S.cash<amount)return false;S.cash-=amount;S.mpEscrow=(S.mpEscrow||0)+amount;tt.mpOffer={from:H.PID,amount,mult:m,n};
+  const offer=(tt,m)=>{const amount=Math.round(Math.max(H.invested(tt),MV(tt.i,H.PID))*m/10)*10;if(S.cash-amount<S.cash*P.keep)return false;if(S.cash<amount)return false;S.cash-=amount;S.mpEscrow=(S.mpEscrow||0)+amount;tt.mpOffer={from:H.PID,amount,mult:m,n};
     emit({kind:'offer',text:`предлагает $${amount} за «${titleOf(tt)}»`,amount:null,tile:tt.i,to:tt.rival});trace.push(bot.name+': предложил $'+amount);return true;};
-  const buyout=tt=>{const amount=Math.round(H.invested(tt)*10),ready=(S.mpForceLap==null)||(S.laps||0)>=S.mpForceLap+2;if(!ready||S.cash<amount)return false;
+  const buyout=tt=>{const amount=MP.forcePrice?MP.forcePrice(tt.i):Math.round(H.invested(tt)*10),ready=(S.mpForceLap==null)||(S.laps||0)>=S.mpForceLap+2;if(!ready||S.cash<amount)return false;
     S.cash-=amount;credit(tt.rival,amount,{force:true,tile:tt.i});tt.mpPrem=amount-(H.invested(tt)-(tt.mpPrem||0));const who=tt.rival;tt.owner='you';delete tt.rival;delete tt.mpOffer;S.mpForceLap=S.laps||0;
-    emit({kind:'sale',text:`выкупил «${titleOf(tt)}» за ×10`,amount:-amount,tile:tt.i,to:who});trace.push(bot.name+': выкуп ×10');return true;};
+    emit({kind:'sale',text:`выкупил «${titleOf(tt)}» за $${amount}`,amount:-amount,tile:tt.i,to:who});trace.push(bot.name+': выкуп за $'+amount);return true;};
   if(f==='lot'){if(mine.length)after.push({t:'lot',tile:mine[0].i,min:Math.round(H.invested(mine[0])*1.5),kind:'sale'});else toast('🤖 У бота нет клеток для торгов');}
   else if(f==='offer'||f==='buy'){let r=rivalHere?t:S.tiles.find(x=>H.isRival(x)&&!H.lotOn(x.i)&&!x.mpOffer);
     if(!r)toast('🤖 Нет чужих клеток — боту нечего предлагать');else{if(S.pos!==r.i)S.pos=r.i;
       if(f==='offer'){if(S.cash<H.invested(r)*1.5)S.cash=Math.round(H.invested(r)*1.5)+50;offer(r,1.5);}
       else{S.cash=Math.max(S.cash,Math.round(H.invested(r)*10)+100);S.mpForceLap=null;buyout(r);}}}
   else{
-    if(rivalHere){if(rnd(.05))buyout(t);else if(rnd(.2))offer(t,rnd(.5)?1.5:2);}
-    for(const l of (v.lots||[])){if(l.seller===H.PID||l.bestBy===H.PID)continue;const next=l.best?Math.ceil(l.best*1.1/10)*10:l.min;if(S.cash>=next*1.5&&rnd(.5))after.push({t:'bid',id:l.id,amount:next});}
-    if(rnd(.06)&&mine.length)after.push({t:'lot',tile:mine[0].i,min:Math.round(H.invested(mine[0])*1.5),kind:'sale'});
+    const V=valOf(H.PID),keep=S.cash*P.keep,leader=leaderOf(v);freshSnap();
+    // Обмен: лучший для его профиля, соперник по базе клеток не в минусе. Строитель и пакостник обменов не предлагают.
+    if(window.MPSwap&&V.swaps&&S.mpProposeN!==v.turn.n){const sw=bestSwap(V,v,keep);
+      if(sw){S.botAsked=S.botAsked||{};S.botAsked[sw.key]=v.turn.n;S.botSwapTo=Object.assign(S.botSwapTo||{},{[sw.to]:Math.floor(v.turn.n/v.players.length)});MPSwap._local.place({to:sw.to,give:sw.give,get:sw.get,pay:sw.pay},emit);S.mpProposeN=v.turn.n;
+        brainLog(bot,`предлагает обмен ${sw.give.join(',')}→${sw.get.join(',')}, доплата ${sw.pay} (выгода $${Math.round(sw.net)})`);}}
+    if(window.MPHand&&(S.mpHand||[]).length&&rnd(P.hand)){const l=MPHand.list(),i=l.findIndex(c=>c.targets.length);if(i>=0){MPHand.play(i,pick(l[i].targets));trace.push(bot.name+': сыграл карту из руки');}}
+    // Выкуп и предложение цены — по ценности клетки для него: выбирает клетку с наибольшей выгодой за вычетом цены.
+    const targets=S.tiles.filter(x=>H.isRival(x)&&!H.lotOn(x.i)&&!x.mpOffer&&!x.mpSwap&&!x.mpSale).map(x=>{const g=gainOf({[x.i]:ME},V,leader),cap=g/(1+V.margin),
+      min=Math.max(H.invested(x),MV(x.i,H.PID));return {x,g,cap,min};}).filter(e=>e.cap>=e.min).sort((a,c)=>(c.cap-c.min)-(a.cap-a.min));
+    const fp=e=>MP.forcePrice?MP.forcePrice(e.x.i):1e9;
+    const here=targets.find(e=>e.x.i===t.i&&rivalHere);
+    if(here&&fp(here)<=here.cap&&S.cash-fp(here)>=keep){buyout(t);brainLog(bot,`выкупает «${titleOf(t)}» (ценность $${Math.round(here.g)})`);}
+    else if(targets.length&&S.mpProposeN!==n&&!(S.botOfferAt!=null&&Math.floor(n/v.players.length)-S.botOfferAt<(V.offerPause||3))){
+      // Отказали — повторяет только дороже (на 0,2 к прошлому множителю, пока клетка этого стоит), иначе отступает на 12 кругов стола.
+      const memo=S.botOffered||{},round=Math.floor(n/v.players.length);
+      const pickM=e=>{const top=Math.max(1,Math.min(P.buyUpTo,Math.floor(e.cap/e.min*10)/10)),last=memo[e.x.i];
+        if(!last||round-last.r>=12)return Math.max(1,Math.min(top,Math.round((P.buyUpTo>1?1+(top-1)/2:1)*10)/10));
+        const m=Math.round((last.m+.2)*10)/10;return m<=top?m:0;};
+      const e=targets.find(x=>pickM(x)>0);const m=e?pickM(e):0;
+      if(e&&offer(e.x,m)){S.mpProposeN=n;S.botOfferAt=round;S.botOffered=Object.assign(memo,{[e.x.i]:{m,r:round}});brainLog(bot,`предлагает ×${m} за «${titleOf(e.x)}» (ценность $${Math.round(e.g)})`);}}
+    // Торги: ставит, пока цена ниже ценности клетки для него.
+    for(const l of (v.lots||[])){if(l.seller===H.PID||l.bestBy===H.PID)continue;const next=l.best?Math.ceil(l.best*1.1/10)*10:l.min,g=gainOf({[l.tile]:ME},V,leader);
+      if(next*(1+V.margin)<=g&&S.cash-next>=keep)after.push({t:'bid',id:l.id,amount:next});}
+    // Свой лот — одиночку, которая его улицы не держит, когда в кассе пусто; по ценности для него с наценкой профиля.
+    if(!(v.lots||[]).some(l=>l.seller===H.PID)&&S.cash<Math.max(150,keep)){const o=ownersNow();
+      // Ту же клетку без покупателей не выставляет снова 8 кругов стола — иначе лот «мигает» каждый ход.
+      const listed=S.botListed||{},fresh=x=>listed[x.i]==null||v.turn.n-listed[x.i]>=8*v.players.length;
+      const onTable=i=>!v.tiles||(v.tiles[i]&&v.tiles[i].owner===H.PID);   // на торги — только синхронизированное со столом
+      const lone=mine.filter(x=>o[(x.i+39)%40]!==ME&&o[(x.i+1)%40]!==ME&&fresh(x)&&onTable(x.i)).sort((a,c)=>baseAt(a.i)-baseAt(c.i));
+      // Старт — не выше, чем даст самый заинтересованный соперник с деньгами (его выгода глазами среднего игрока с запасом 25%); выставляет
+      // одиночку, только если кто-то даст хотя бы её ценность для бота. Раньше старт был «ценность × наценка профиля»
+      // (×1,1…1,8) — одиночка без соседей покупателю стоит меньше, и 6 лотов из 8 уходили без ставок (Интерфейс, прод 03.10).
+      const demand=i=>Math.max(0,...v.players.filter(p=>p.pid!==H.PID).map(p=>Math.min(theirGain({[i]:p.pid},p.pid)/1.25,(p.cash||0)*.8)));
+      const sale=lone.map(x=>{const loss=Math.max(H.invested(x),-gainOf({[x.i]:null},V)),d=demand(x.i);
+        return {x,loss,min:Math.floor(Math.min(loss*P.sellAt,d)/10)*10};}).filter(e=>e.min>=e.loss*.95);
+      if(lone.length>(profKey(H.PID)==='builder'?2:0)&&sale.length){const {x,min}=sale[0];
+        S.botListed=Object.assign(listed,{[x.i]:v.turn.n});
+        after.push({t:'lot',tile:x.i,min,kind:'sale'});brainLog(bot,`выставил одиночку «${titleOf(x)}» от $${min}`);}}
   }
 }
 function debtHidden({credit,emit,v,after,bot}){
   if(S.cash>=0)return;
   if(!(S.loans||[]).some(l=>l.micro)){const amt=Math.min(500,Math.max(100,Math.ceil((-S.cash+50)/50)*50));S.loans=S.loans||[];S.loans.push({tier:0,micro:true,name:'Микрозайм',principal:amt,rate:.25,strikes:0,maxStrikes:99});S.cash+=amt;emit({kind:'loan',text:`взял микрозайм $${amt}`,amount:amt,tile:S.pos});trace.push(bot.name+': микрозайм $'+amt);}
   if(S.cash<0){let v2=0;for(const k of myKiosks()){v2+=Math.round((k.goods||0)*buyPrice(k.good)*.5);k.goods=0;}if(v2>0){S.cash+=v2;emit({kind:'sale',text:`продал товар с точек за $${v2}`,amount:v2,tile:S.pos});}}
-  if(S.cash<0&&(S.mpDebtLaps||0)>=2){let need=-S.cash;const mine=S.tiles.filter(x=>x.owner&&(x.type==='kiosk'||x.type==='biz')&&!(typeof sfIsLot==='function'?sfIsLot(x):(!x.owner&&(x.lot||x.good==='lot')))&&!H.lotOn(x.i)).sort((a,b)=>H.invested(a)-H.invested(b));
-    for(const x of mine){if(need<=0)break;const inv=Math.round(H.invested(x));after.push({t:'lot',tile:x.i,min:inv,kind:'bankrupt',bank:Math.round(inv*.5)});need-=Math.round(inv*.5);}}
+  if(S.cash<0&&(S.mpDebtLaps||0)>=2){let need=-S.cash;const V=valOf(H.PID);freshSnap();
+    // Сначала то, что меньше всего ломает его улицы (потеря ценности на доллар базы).
+    const mine=S.tiles.filter(x=>x.owner&&(x.type==='kiosk'||x.type==='biz')&&!(typeof sfIsLot==='function'?sfIsLot(x):(!x.owner&&(x.lot||x.good==='lot')))&&!H.lotOn(x.i))
+      .map(x=>({x,k:-gainOf({[x.i]:null},V)/Math.max(1,baseAt(x.i))})).sort((a,c)=>a.k-c.k).map(e=>e.x);
+    for(const x of mine){if(need<=0)break;const mv=Math.round(Math.max(H.invested(x),MV(x.i)));after.push({t:'lot',tile:x.i,min:mv,kind:'bankrupt',bank:Math.round(mv*.5)});need-=Math.round(mv*.5);}}   // как у игрока: от рыночной цены
 }
 
 // Стратегия после остановки: предложения, выкуп, ставки на торгах, иногда свой лот. force — приказ из панели.
@@ -326,14 +500,15 @@ async function doForce(f,t){
   if(f==='offer'){if(S.cash<H.invested(r)*1.5)S.cash=Math.round(H.invested(r)*1.5)+50;H.placeOffer(r,1.5);}
   if(f==='buy'){S.cash=Math.max(S.cash,Math.round(H.invested(r)*10)+100);S.mpForceLap=null;H.forceBuy(r);}
 }
-window.MPBots={trace,add:addBot,clear:removeBots,acting:()=>!!acting,busy:()=>busy,instant:()=>!!acting&&speed>=99,list:()=>[...bots.values()].map(b=>({pid:b.pid,name:b.name})),
+window.MPBots={brain:{VALUE,gainOf,theirGain,bestSwap,freshSnap,ME,leaderOf,cityWorth},trace,add:addBot,clear:removeBots,acting:()=>!!acting,busy:()=>busy,instant:()=>!!acting&&speed>=99,list:()=>[...bots.values()].map(b=>({pid:b.pid,name:b.name})),
   holdHostView(v,now){heldView=v;heldNow=now;if(acting===H.PID)H.view=v;if(v&&v.phase!=='play'&&acting)unstick();},   // свой авто-ход: вид свежий, применим в конце; партия кончилась — ход бота обрываем
   get speed(){return speed;},set speed(x){speed=+x||1;},
   get force(){return force;},set force(f){force=f;},
   get autoMe(){return autoMe;},set autoMe(x){autoMe=!!x;schedule();},
 };
 
-// ---- панель механик ----
+// ---- панель механик: только тестовый стол ----
+if(H.test){
 const CHANCE_LABELS={birthday:'🎂 День рождения',treat:'🍻 Проставился',raid:'🚔 Облава',mtv:'📺 Сюжет на MTV',complaint:'📋 Жалоба соседей',stash:'💰 Заначка общака',parking:'🚗 Штраф за парковку',sneakers:'👟 Кроссовки',robin:'🤑 Робин Гуд',roof:'🛡 Крыша',roadwork:'🚧 Ремонт дороги',snitch:'🚔 Донос',queue:'⏳ Очередь в ЖЭК',blackout:'❄️ Отключили свет'};
 const css=document.createElement('style');css.textContent=`
 .mp-test{position:fixed;right:8px;left:auto;bottom:calc(150px + env(safe-area-inset-bottom));top:auto;   /* справа у дока: слева под шапкой журнал денег, слева у дока — склад */
@@ -380,4 +555,5 @@ panel.addEventListener('click',e=>{
 });
 // Кнопка «+ Бот» рядом с «Начать» в лобби хозяина.
 setInterval(()=>{const st=$('mpStart');if(st&&!$('mpBotBtn')){const b=document.createElement('button');b.id='mpBotBtn';b.className='sec mp-botbtn';b.type='button';b.textContent='🤖 + Бот';b.onclick=addBot;st.before(b);}},700);
+}
 })();

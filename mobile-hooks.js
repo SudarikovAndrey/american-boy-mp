@@ -58,7 +58,10 @@ function step(from,to,ms,kind){
   return MobileHost.request('step',{from,to,ms:duration,kind},10000);
 }
 function float(i,text,color,size){
-  if(!S.tiles[i]?.drop)return;
+  // Подписи над клетками — только у находок (22.09); исключение — проход пустыря «+$5» (SF.lotPass, плейтест 4:
+  // «непонятно, откуда деньги»), иначе её никто не видел.
+  const lot=typeof sfIsLot==='function'&&sfIsLot(S.tiles[i]);
+  if(!S.tiles[i]?.drop&&!lot)return;
   const at=screenOfTile(i),el=document.createElement('span');
   el.className='map-float';el.textContent=text;el.style.left=at.x+'px';el.style.top=at.y+'px';el.style.color=color||'#fff1ce';if(typeof cashGlyph==='function')cashGlyph(el);
   document.body.append(el);setTimeout(()=>el.remove(),1400);
@@ -555,8 +558,8 @@ function onboardingSlides(){
  const m=onboardUpgradeModel();
  const goal=MAP1?3:CFG.TICKET_PTS;
  return [
-  {title:'Покупай точку',text:'Встал на свободную клетку — открой карточку и купи точку.',art:`<div class="ob-banner"><img src="assets/points/pt_gum_1.webp" alt="Лоток жвачки"></div><div class="ob-chip">Купить · <i class="cash-glyph"></i>60</div>`},
-  {title:'Покупай товар',text:'Закупай на складе. Товар сам разложится по твоим точкам.',art:`<div class="ob-supply"><div class="ob-supply-warehouse"><div class="costco-sign" role="img" aria-label="Склад Costco">${costcoArt(19,10,781,267)}</div><b>Склад</b></div><span class="ob-route-arrow" aria-hidden="true">➜</span><div class="ob-supply-goods"><img src="assets/goods/gum.webp" alt="Жвачка"><img src="assets/goods/cola.webp" alt="Кола"><b>Товары</b></div><span class="ob-route-arrow" aria-hidden="true">➜</span><div class="ob-supply-points"><img src="assets/points/pt_gum_1.webp" alt="Лоток жвачки"><img src="assets/points/pt_cola_1.webp" alt="Тележка колы"><b>Твои точки</b></div></div>`},
+  {title:'Покупай точку',text:'Встал на свободную клетку — открой карточку и купи точку.',art:`<div class="ob-banner"><img loading="lazy" src="assets/points/pt_gum_1.webp" alt="Лоток жвачки"></div><div class="ob-chip">Купить · <i class="cash-glyph"></i>60</div>`},
+  {title:'Покупай товар',text:'Закупай на складе. Товар сам разложится по твоим точкам.',art:`<div class="ob-supply"><div class="ob-supply-warehouse"><div class="costco-sign" role="img" aria-label="Склад Costco">${costcoArt(19,10,781,267)}</div><b>Склад</b></div><span class="ob-route-arrow" aria-hidden="true">➜</span><div class="ob-supply-goods"><img src="assets/goods/gum.webp" alt="Жвачка"><img src="assets/goods/cola.webp" alt="Кола"><b>Товары</b></div><span class="ob-route-arrow" aria-hidden="true">➜</span><div class="ob-supply-points"><img loading="lazy" src="assets/points/pt_gum_1.webp" alt="Лоток жвачки"><img src="assets/points/pt_cola_1.webp" alt="Тележка колы"><b>Твои точки</b></div></div>`},
   {title:'Прошёл старт — касса!',text:'Проходишь клетку с флажком — товар продаётся. Монеты твои!',art:`<div class="ob-field-fragment" role="img" aria-label="Фрагмент настоящей карты: Джонни рядом с красной стартовой клеткой и клетчатым флажком"><i class="ob-start-ring"></i><img class="ob-start-coin" src="assets/icons/soft.webp" alt=""></div><div class="ob-sale"><img src="assets/goods/gum.webp" alt="Товар"><span aria-hidden="true">➜</span><img src="assets/icons/soft.webp" alt="Монеты"><b>Продажи за круг</b></div>`},
   {title:'Прокачивай точку',text:'Нажми «Улучшить». Следующий уровень увеличит выделенный параметр.',art:onboardUpgradeArt(m),upgrade:true},
   MAP1?{title:'Открой следующую карту',text:'Купи точки, прокачай их и продавай товар. Выполни все три задания карты.',art:`<div class="ob-goal-journey ob-map-goal"><img src="assets/icons/hud-johnny.webp" alt="Джонни"><div class="ob-goal-score"><b>3 из 3</b><span>задания карты</span><div class="ob-goal-meter"><i></i></div></div><span class="ob-route-arrow">➜</span><div class="ob-next-map"><img src="assets/start/city-landscape.webp" alt="Новый район"><b>Следующий район</b></div></div>`}:

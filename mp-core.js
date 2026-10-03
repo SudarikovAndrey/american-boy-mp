@@ -3,8 +3,8 @@
 // их зовёт хозяин стола (web/mp.js) и тесты (tests/mp-core.test.cjs). Сети и DOM здесь нет.
 (function(root){
 'use strict';
-const COLORS=['#A92720','#243F4B','#C99A32','#5E7A4A'];     // красный · синий · золото · зелёный (Style Bible)
-const COLOR_NAMES=['красные','синие','золотые','зелёные'];
+const COLORS=['#E06C1E','#243F4B','#C99A32','#3E9BC7'];     // оранжевый · синий · золото · голубой. Красный и зелёный — только у клеток поля: опасные и полезные (решение Андрея 03.10)
+const COLOR_NAMES=['оранжевые','синие','золотые','голубые'];
 const MAX_PLAYERS=4, MIN_PLAYERS=2;
 // rounds — длина партии в проходах через старт (решение продюсера 01.10: «проходы через старт = круги»).
 // Плейтест 01.10 (второй): длина партии — по времени, 15…30 минут (решение продюсера): кругов 25…500 было слишком много.
@@ -23,7 +23,7 @@ const WIN_OPTIONS=[
   {id:'cash',name:'Первый миллионер',text:'Первый, у кого на руках $10 000 наличными, побеждает сразу.',goal:10000},
   {id:'chain',name:'Король техники',text:'Первый, кто купил обе лицензии и построил 3 точки техники, побеждает сразу.',goal:3},
   {id:'city',name:'Весь город',text:'Первый, кто обеспечил город всеми 6 категориями товара и держит 2 бизнеса, побеждает сразу.',goal:6},
-  {id:'empire',name:'Империя',text:'Первый, у кого 10 владений (точки и бизнесы вместе), побеждает сразу.',goal:10},
+  {id:'empire',name:'Империя',text:'Первый, у кого 9 владений (точки и бизнесы вместе), побеждает сразу.',goal:9},   // 9 из 25 (19 пустырей + 6 бизнесов): с клетками «Шанса» пустырей стало меньше — было 10 из 28
   {id:'rent',name:'Рантье',text:'Первый, кто собрал $3 000 рентой с соперников, побеждает сразу.',goal:3000},
 ];
 // Плейтест 01.10: 25 кругов показались очень короткой партией, на ход в 30 с не хватало времени.
@@ -56,7 +56,16 @@ function setMode(T,m){if(!MODE_OPTIONS.includes(m))return false;T.settings.mode=
 const timed=T=>winOf(T).id==='capital';
 const modeOf=T=>timed(T)?(T.settings.mode==='laps'?'laps':'time'):'none';
 function setWin(T,id){if(!WIN_OPTIONS.some(w=>w.id===id))return false;T.settings.win=id;return true;}
-const winOf=T=>WIN_OPTIONS.find(w=>w.id===(T.settings&&T.settings.win))||WIN_OPTIONS[0];
+// Пороги под длину партии (решение продюсера 02.10 по прогону «Дебага»): «Миллионер» и «Рантье» — от минут (на 20 минут
+// $2 500 налом и $250 ренты, пропорционально); в режиме кругов минуты оцениваются как круги × minPerLap. «Империя» — по числу игроков.
+const WIN_SCALE={cashPer20:10000,rentPer20:250,minPerLap:2,round:50,empire:{2:12,3:10,4:9}};
+function lengthMinutes(T){const s=T.settings||{};return s.mode==='laps'?(+s.rounds||DEFAULTS.rounds)*WIN_SCALE.minPerLap:(+s.minutes||DEFAULTS.minutes);}
+const r50=x=>Math.max(WIN_SCALE.round,Math.round(x/WIN_SCALE.round)*WIN_SCALE.round);
+function winOf(T){const w=WIN_OPTIONS.find(x=>x.id===(T.settings&&T.settings.win))||WIN_OPTIONS[0],m=lengthMinutes(T),n=Math.max(2,Math.min(4,(T.players||[]).length||2));
+  if(w.id==='cash'){const g=r50(WIN_SCALE.cashPer20*m/20);return Object.assign({},w,{goal:g,text:`Первый, у кого на руках $${g.toLocaleString('ru-RU')} наличными, побеждает сразу.`});}
+  if(w.id==='rent'){const g=r50(WIN_SCALE.rentPer20*m/20);return Object.assign({},w,{goal:g,text:`Первый, кто собрал $${g.toLocaleString('ru-RU')} рентой с соперников, побеждает сразу.`});}
+  if(w.id==='empire'){const g=WIN_SCALE.empire[n];return Object.assign({},w,{goal:g,text:`Первый, у кого ${g} владений (точки и бизнесы вместе), побеждает сразу.`});}
+  return w;}
 function newTable(room,settings){
   return {room,phase:'lobby',settings:Object.assign({},DEFAULTS,settings||{}),players:[],tiles:null,
           turn:null,applied:{},result:null,match:0,log:[],pot:0,slotPot:0,rent:{},lots:[],events:[],evSeq:0};
@@ -135,17 +144,25 @@ function applyState(T,pid,pack,now){
 function mergeTiles(cur,next,pid,credits){
   if(!cur||!Array.isArray(next))return next;
   // Обмен клетками (решение продюсера 02.10): хозяин клетки t, принимая обмен, забирает клетку give у предложившего.
-  const swapGive=new Set();
-  for(const c of cur)if(c&&c.owner===pid&&c.mpSwap){const g=cur[c.mpSwap.give];if(g&&g.owner===c.mpSwap.from&&next[c.i]&&next[c.i].owner===c.mpSwap.from)swapGive.add(c.mpSwap.give);}
+  // Обмен на карте (m5-swapmap): o={from,to,give[],get[]} в системе автора. Получатель (pid) принимает — его get уходят автору,
+  // give автора приходят к нему. Пропускаем все клетки разом и только если все клетки у прежних хозяев: атомарно.
+  const swapGive=new Set(),swapHold=new Set(),seenSw=new Set();
+  for(const c of cur){const o=c&&c.mpSwap;if(!o||o.to!==pid||c.owner!==pid||seenSw.has(o.id)||!Array.isArray(o.give)||!Array.isArray(o.get))continue;seenSw.add(o.id);
+    const ok=o.get.every(i=>cur[i]&&cur[i].owner===pid&&next[i]&&next[i].owner===o.from)&&o.give.every(i=>cur[i]&&cur[i].owner===o.from&&next[i]&&next[i].owner===pid);
+    if(ok)o.give.forEach(i=>swapGive.add(i));else o.get.forEach(i=>swapHold.add(i));}   // неполный обмен — свои клетки получателя тоже не уходят
   return cur.map((t,i)=>{const n=next[i];if(!n)return t;
+    if(swapHold.has(i)&&n.owner&&n.owner!==pid)return t;         // половина обмена не проходит — клетка остаётся
     if(!t.owner||t.owner===pid)return n;                         // свободная или своя — верим целиком
-    if(swapGive.has(i)&&n.owner===pid)return n;                  // обмен принят: клетка предложившего — хозяину
+    if(swapGive.has(i)&&n.owner===pid){const o=Object.assign({},n);delete o.mpSwap;return o;}   // обмен принят: клетка автора — получателю
+    // Продажа конкретному сопернику (02.10): покупатель забирает клетку, если в пакете есть оплата продавцу не меньше цены.
+    if(t.mpSale&&t.mpSale.to===pid&&n.owner===pid&&(credits||[]).some(c=>c&&c.sale&&c.tile===i&&c.to===t.owner&&+c.cash>=t.mpSale.amount)){const o=Object.assign({},n);delete o.mpSale;return o;}
     if(n.owner===pid&&(credits||[]).some(c=>c&&c.force&&c.tile===i&&c.to===t.owner&&+c.cash>0))return n;   // выкуп ×10 оплачен
     const o=Object.assign({},t);if('drop' in n)o.drop=n.drop;if('insp' in n)o.insp=n.insp;   // чужая: только находки и проверки
     if(n.mpOffer&&n.mpOffer.from===pid)o.mpOffer=n.mpOffer;                                    // своё предложение хозяину
     else if(t.mpOffer&&t.mpOffer.from===pid&&!n.mpOffer)delete o.mpOffer;                     // забрал резерв / отозвал
+    if(t.mpSale&&t.mpSale.to===pid&&!n.mpSale)delete o.mpSale;                                 // покупатель отказал
     if(n.mpSwap&&n.mpSwap.from===pid)o.mpSwap=n.mpSwap;                                        // своё предложение обмена
-    else if(t.mpSwap&&t.mpSwap.from===pid&&!n.mpSwap)delete o.mpSwap;
+    else if(t.mpSwap&&(t.mpSwap.from===pid||t.mpSwap.to===pid)&&!n.mpSwap)delete o.mpSwap;     // автор отозвал или получатель ответил
     return o;});
 }
 // Мини-игра (бандит, 21…) останавливает часы хода: «за 30 секунд я должен быстро тыкать — фатально».
@@ -281,6 +298,23 @@ function applyHit(T,pid,h){
     case 'skip':{if(!rival)return false;to.skip=(to.skip||0)+1;event(T,{from:pid,kind:'hit',text:`${to.name} пропустит ход`,amount:null,tile:null,to:to.pid});return true;}
     case 'freeze':{const t=T.tiles&&T.tiles[h.tile];if(!t||!t.owner||t.owner===pid)return false;t.frozen=T.turn.n+n;
       event(T,{from:pid,kind:'hit',text:`заморозил клетку ${pnameOf(T,t.owner)} на круг`,amount:null,tile:t.i,to:t.owner});return true;}
+    // Карты из руки (плейтест 5): урезать следующий проход старта, испортить товар, налог на лидера.
+    case 'cut':{if(!rival)return false;const k=h.cut===0?0:0.5;to.s.mpLapCut=Math.min(to.s.mpLapCut==null?1:to.s.mpLapCut,k);
+      event(T,{from:pid,kind:'hit',text:k?`урезал ${to.name} продажи на старте вдвое`:`устроил ${to.name} забастовку — проход старта без продаж`,amount:null,tile:null,to:to.pid});return true;}
+    case 'spoil':{const t=T.tiles&&T.tiles[h.tile];if(!t||!t.owner||t.owner===pid||t.type!=='kiosk'||!(t.goods>0))return false;const lost=Math.ceil(t.goods/2);t.goods-=lost;
+      event(T,{from:pid,kind:'hit',text:`испортил ${lost} шт товара у ${pnameOf(T,t.owner)}`,amount:null,tile:t.i,to:t.owner});return true;}
+    case 'levy':{if(!rival)return false;const x=Math.round(Math.max(0,to.s.cash||0)*0.3);if(x<=0)return false;to.s.cash-=x;T.pot=(T.pot||0)+x;   // 30% нала, без потолка (продюсер 02.10)
+      event(T,{from:pid,kind:'hit',text:`наслал на ${to.name} налоговую: $${x} в копилку`,amount:null,tile:null,to:to.pid});return true;}
+    // «Ремонт дороги» (продюсер 02.10): соперник едет вперёд до первой чужой для него клетки и платит там ренту хозяину.
+    // Хозяин — активный игрок: ренту он прибавляет у себя сам (его срез придёт пакетом), стол её не дублирует.
+    case 'push':{if(!rival)return false;const t=T.tiles&&T.tiles[h.tile];if(!t)return false;to.s.pos=t.i;const rent=Math.max(0,Math.round(+h.rent||0)),own=t.owner;
+      if(rent&&own&&own!==to.pid){to.s.cash=(to.s.cash||0)-rent;if(own!==pid){const o=T.players.find(x=>x.pid===own);if(o&&o.s)o.s.cash=(o.s.cash||0)+rent;}T.rent[own]=(T.rent[own]||0)+rent;}
+      event(T,{from:pid,kind:'hit',text:`отправил ${to.name} вперёд на «чужую» клетку${rent?` — рента $${rent}`:''}`,amount:null,tile:t.i,to:to.pid});return true;}
+    // «Просрочка»: портится и пропадает половина запаса во всех точках соперника.
+    case 'spoilAll':{if(!rival)return false;let lost=0;for(const t of T.tiles||[])if(t.owner===to.pid&&t.type==='kiosk'&&t.goods>0){const k=Math.ceil(t.goods/2);t.goods-=k;lost+=k;}
+      if(!lost)return false;event(T,{from:pid,kind:'hit',text:`у ${to.name} испортилось ${lost} шт товара`,amount:null,tile:null,to:to.pid});return true;}
+    // «Сходка»: сам пропускаешь следующий ход (плата за карту).
+    case 'rest':{const me=T.players.find(x=>x.pid===pid);if(!me)return false;me.skip=(me.skip||0)+1;event(T,{from:pid,kind:'hit',text:`${me.name} пропустит следующий ход — сходка`,amount:null,tile:null,to:pid});return true;}
     case 'insp':{const t=T.tiles&&T.tiles[h.tile];if(!t||!t.owner||t.owner===pid||t.type!=='kiosk'||t.insp)return false;t.insp=true;
       event(T,{from:pid,kind:'hit',text:`натравил инспектора на точку ${pnameOf(T,t.owner)}`,amount:null,tile:t.i,to:t.owner});return true;}
   }
@@ -380,12 +414,13 @@ function viewFor(T,pid,valuer){
   return {room:T.room,host:T.hostPid||null,paused:T.paused||null,finalRound:T.finalRound||null,finalBy:T.finalBy||null,phase:T.phase,settings:T.settings,match:T.match,startedAt:T.startedAt||null,turn:T.turn,result:T.result,
     tiles:T.tiles,log:T.log.slice(-6),pot:Math.round(T.pot||0),slotPot:Math.round(T.slotPot||0),deadline:T.deadline||null,win:winOf(T),lots:T.lots||[],events:(T.events||[]).slice(-12),
     players:T.players.map(p=>({pid:p.pid,name:p.name,seat:p.seat,color:p.color,online:p.online,
-      pos:p.s?p.s.pos:0,laps:p.s?p.s.laps||0:0,jail:p.s?p.s.jail||0:0,cash:p.s?Math.round(p.s.cash||0):0,skip:p.skip||0,
+      pos:p.s?p.s.pos:0,laps:p.s?p.s.laps||0:0,hand:p.s&&Array.isArray(p.s.mpHand)?p.s.mpHand.length:0,   // число карт в руке видно всем, какие — нет
+      jail:p.s?p.s.jail||0:0,cash:p.s?Math.round(p.s.cash||0):0,skip:p.skip||0,
       cap:T.tiles&&valuer?capital(T,p.pid,valuer):null,chain:T.tiles?sfChain(T,p.pid):null,win:T.tiles?winProgress(T,p.pid,valuer):null})),
     mine:me&&me.s?me.s:null};
 }
 
-const api={BOARD_OPTIONS,setBoardMap,COLORS,COLOR_NAMES,MAX_PLAYERS,MIN_PLAYERS,DEFAULTS,ROUND_OPTIONS,TURN_OPTIONS,MINUTE_OPTIONS,MODE_OPTIONS,WIN_OPTIONS,TIMEOUT_GRACE_MS,TABLE_PAUSE_MAX_MS,EXTEND_MINUTES,EXTEND_LAPS,setMode,modeOf,timed,extend,
+const api={WIN_SCALE,lengthMinutes,BOARD_OPTIONS,setBoardMap,COLORS,COLOR_NAMES,MAX_PLAYERS,MIN_PLAYERS,DEFAULTS,ROUND_OPTIONS,TURN_OPTIONS,MINUTE_OPTIONS,MODE_OPTIONS,WIN_OPTIONS,TIMEOUT_GRACE_MS,TABLE_PAUSE_MAX_MS,EXTEND_MINUTES,EXTEND_LAPS,setMode,modeOf,timed,extend,
   PAUSE_MAX_MS,RESUME_MIN_MS,autoRounds,setRounds,setMinutes,setWin,winOf,winProgress,mergeTiles,makeCode,normCode,newTable,join,leave,canStart,start,active,applyState,pause,tablePause,advance,endTurn,tick,
   capital,ranking,sfChain,checkEarly,finish,backToLobby,viewFor,lotApi,listLot,bid,resolveLots,applyHit,event};
 root.MPCore=api;
